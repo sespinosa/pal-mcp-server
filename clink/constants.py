@@ -8,6 +8,9 @@ from pathlib import Path
 DEFAULT_TIMEOUT_SECONDS = 1800
 DEFAULT_STREAM_LIMIT = 10 * 1024 * 1024  # 10MB per stream
 
+DISPATCH_RUNNER = "dispatch"
+DEFAULT_ROLE_PROMPT = "systemprompts/clink/default.txt"
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BUILTIN_PROMPTS_DIR = PROJECT_ROOT / "systemprompts" / "clink"
 CONFIG_DIR = PROJECT_ROOT / "conf" / "cli_clients"

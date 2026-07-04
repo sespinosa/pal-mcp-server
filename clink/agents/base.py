@@ -52,6 +52,64 @@ class BaseCLIAgent:
         self._parser: BaseParser = get_parser(client.parser)
         self._logger = logging.getLogger(f"clink.runner.{client.name}")
 
+    def _resolve_executable(self, command: list[str]) -> list[str]:
+        """Resolve command[0] to an absolute path for cross-platform compatibility."""
+        executable_name = command[0]
+        resolved_executable = shutil.which(executable_name)
+        if resolved_executable is None:
+            raise CLIAgentError(
+                f"Executable '{executable_name}' not found in PATH for CLI '{self.client.name}'. "
+                f"Ensure the command is installed and accessible."
+            )
+        command[0] = resolved_executable
+        return command
+
+    async def _execute_command(
+        self,
+        command: Sequence[str],
+        *,
+        input_text: str | None,
+        timeout_seconds: float,
+    ) -> tuple[int, str, str]:
+        """Spawn a single CLI command and return (returncode, stdout, stderr)."""
+        cwd = str(self.client.working_dir) if self.client.working_dir else None
+        env = self._build_environment()
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                limit=DEFAULT_STREAM_LIMIT,
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise CLIAgentError(f"Executable not found for CLI '{self.client.name}': {exc}") from exc
+        except OSError as exc:
+            # e.g. E2BIG when a substituted prompt exceeds the platform argv limit
+            raise CLIAgentError(f"Failed to launch CLI '{self.client.name}': {exc}") from exc
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(input_text.encode("utf-8") if input_text is not None else None),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise CLIAgentError(
+                f"CLI '{self.client.name}' timed out after {self.client.timeout_seconds} seconds",
+                returncode=None,
+            ) from exc
+
+        return (
+            process.returncode,
+            stdout_bytes.decode("utf-8", errors="replace"),
+            stderr_bytes.decode("utf-8", errors="replace"),
+        )
+
     async def run(
         self,
         *,
@@ -66,25 +124,10 @@ class BaseCLIAgent:
         _ = (files, images)
         # The runner simply executes the configured CLI command for the selected role.
         command = self._build_command(role=role, system_prompt=system_prompt)
-        env = self._build_environment()
-
-        # Resolve executable path for cross-platform compatibility (especially Windows)
-        executable_name = command[0]
-        resolved_executable = shutil.which(executable_name)
-        if resolved_executable is None:
-            raise CLIAgentError(
-                f"Executable '{executable_name}' not found in PATH for CLI '{self.client.name}'. "
-                f"Ensure the command is installed and accessible."
-            )
-        command[0] = resolved_executable
+        command = self._resolve_executable(command)
 
         sanitized_command = list(command)
 
-        cwd = str(self.client.working_dir) if self.client.working_dir else None
-        limit = DEFAULT_STREAM_LIMIT
-
-        stdout_text = ""
-        stderr_text = ""
         output_file_content: str | None = None
         start_time = time.monotonic()
 
@@ -104,39 +147,16 @@ class BaseCLIAgent:
             sanitized_command = list(command_with_output_flag)
 
         self._logger.debug("Executing CLI command: %s", " ".join(sanitized_command))
-        if cwd:
-            self._logger.debug("Working directory: %s", cwd)
+        if self.client.working_dir:
+            self._logger.debug("Working directory: %s", self.client.working_dir)
 
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command_with_output_flag,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                limit=limit,
-                env=env,
-            )
-        except FileNotFoundError as exc:
-            raise CLIAgentError(f"Executable not found for CLI '{self.client.name}': {exc}") from exc
-
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(prompt.encode("utf-8")),
-                timeout=self.client.timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.communicate()
-            raise CLIAgentError(
-                f"CLI '{self.client.name}' timed out after {self.client.timeout_seconds} seconds",
-                returncode=None,
-            ) from exc
+        return_code, stdout_text, stderr_text = await self._execute_command(
+            command_with_output_flag,
+            input_text=prompt,
+            timeout_seconds=self.client.timeout_seconds,
+        )
 
         duration = time.monotonic() - start_time
-        return_code = process.returncode
-        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
 
         if output_file_path and output_file_path.exists():
             output_file_content = output_file_path.read_text(encoding="utf-8", errors="replace")

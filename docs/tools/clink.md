@@ -148,7 +148,57 @@ Each preset points to role-specific prompts in `systemprompts/clink/`. Duplicate
 
 > **Why `--yolo` for Gemini?** The Gemini CLI currently requires automatic approvals to execute its own tools (for example `run_shell_command`). Without the flag it errors with `Tool "run_shell_command" not found in registry`. See [issue #5382](https://github.com/google-gemini/gemini-cli/issues/5382) for more details.
 
-**Adding new CLIs**: Drop a JSON config into `conf/cli_clients/`, create role prompts in `systemprompts/clink/`, and register a parser/agent if the CLI outputs a new format.
+**Adding new CLIs**: Drop a JSON config into `conf/cli_clients/`, create role prompts in `systemprompts/clink/`, and register a parser/agent if the CLI outputs a new format. Custom CLIs that aren't built in must set `"parser"` explicitly (use `"text"` for plain-text output).
+
+## Asynchronous (Dispatch/Poll) Backends
+
+Some coding agents don't answer inline — they dispatch work to a remote or background service
+(cloud coding agents such as Codex Cloud or Google Jules, CI-driven agents, task queues) and expose
+`submit` / `status` / `result` style subcommands. Clink can drive these through the same interface
+as local CLIs by adding a `dispatch` block to the client config. A generic example (map the args
+and patterns onto your CLI's actual subcommands and output):
+
+```json
+{
+  "name": "mycloud",
+  "command": "mycloud-cli",
+  "parser": "text",
+  "additional_args": ["submit", "--task", "{prompt}"],
+  "timeout_seconds": 3600,
+  "dispatch": {
+    "handle_pattern": "task_id:\\s*([A-Za-z0-9-]+)",
+    "poll_args": ["status", "{handle}"],
+    "poll_interval_seconds": 30,
+    "done_pattern": "state:\\s*(completed|done)",
+    "failed_pattern": "state:\\s*(failed|cancelled)",
+    "collect_args": ["result", "{handle}"]
+  }
+}
+```
+
+How it runs:
+
+1. **Dispatch** – the regular configured command submits the task. The prompt is passed on stdin,
+   or substituted into arguments when any of them contains `{prompt}` (for CLIs that can't read
+   stdin). The task handle is extracted from the output with `handle_pattern` (first capture group).
+2. **Poll** (optional) – `poll_args` runs against the bare executable every `poll_interval_seconds`
+   (default 15) with `{handle}` substituted, until `done_pattern` matches, `failed_pattern` matches
+   (error), or the client's `timeout_seconds` budget runs out. Errors and timeouts always include
+   the task handle so a still-running remote task stays trackable. Anchor `handle_pattern` to the
+   exact id format — extracted handles are validated against a conservative charset before being
+   substituted into commands. A non-zero exit from a poll command aborts the run (no retry state
+   in v1).
+3. **Collect** (optional) – `collect_args` fetches the final result; without it the last poll output
+   is used. The result is parsed with the configured parser and returned like any other clink
+   response, with `dispatch_handle` and `poll_attempts` in the metadata.
+
+Omit `poll_args` entirely for **fire-and-forget** services that expose no status API and deliver
+results out of band (e.g. a cloud agent that opens a pull request): clink then returns the dispatch
+acknowledgement — typically containing the task id and session URL — immediately.
+
+> **Note**: A spawned cloud task usually runs on the account the backing CLI is authenticated with
+> and may consume paid quota. Clink never dispatches on its own — calls still go through your MCP
+> client's regular tool approval.
 
 ## When to Use Clink vs Other Tools
 

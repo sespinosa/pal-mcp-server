@@ -10,7 +10,9 @@ from pathlib import Path
 
 from clink.constants import (
     CONFIG_DIR,
+    DEFAULT_ROLE_PROMPT,
     DEFAULT_TIMEOUT_SECONDS,
+    DISPATCH_RUNNER,
     INTERNAL_DEFAULTS,
     PROJECT_ROOT,
     USER_CONFIG_DIR,
@@ -131,8 +133,10 @@ class ClinkRegistry:
 
         normalized_name = raw.name.strip()
         internal_defaults = INTERNAL_DEFAULTS.get(normalized_name.lower())
-        if internal_defaults is None:
-            raise RegistryLoadError(f"CLI '{raw.name}' is not supported by clink")
+        if internal_defaults is None and raw.parser is None:
+            raise RegistryLoadError(
+                f"CLI '{raw.name}' is not supported by clink. Custom CLIs must define a 'parser' in configuration."
+            )
 
         executable = self._resolve_executable(raw, internal_defaults, source_path)
 
@@ -143,13 +147,21 @@ class ClinkRegistry:
             internal_defaults.timeout_seconds if internal_defaults else DEFAULT_TIMEOUT_SECONDS
         )
 
-        parser_name = internal_defaults.parser
+        parser_name = raw.parser or (internal_defaults.parser if internal_defaults else None)
         if not parser_name:
             raise RegistryLoadError(
                 f"CLI '{raw.name}' must define a parser either in configuration or internal defaults"
             )
 
-        runner_name = internal_defaults.runner if internal_defaults else None
+        if raw.dispatch is not None:
+            if raw.output_to_file is not None:
+                raise RegistryLoadError(
+                    f"CLI '{raw.name}' cannot combine 'dispatch' with 'output_to_file' (dispatch output is "
+                    "read from the phase commands directly)"
+                )
+            runner_name = DISPATCH_RUNNER
+        else:
+            runner_name = internal_defaults.runner if internal_defaults else None
 
         env = self._merge_env(raw, internal_defaults)
         working_dir = self._resolve_optional_path(raw.working_dir, source_path.parent)
@@ -169,6 +181,7 @@ class ClinkRegistry:
             roles=roles,
             output_to_file=output_to_file,
             working_dir=working_dir,
+            dispatch=raw.dispatch,
         )
 
     def _resolve_executable(
@@ -201,7 +214,7 @@ class ClinkRegistry:
     ) -> dict[str, ResolvedCLIRole]:
         roles: dict[str, CLIRoleConfig] = dict(raw.roles)
 
-        default_role_prompt = internal_defaults.default_role_prompt if internal_defaults else None
+        default_role_prompt = internal_defaults.default_role_prompt if internal_defaults else DEFAULT_ROLE_PROMPT
         if "default" not in roles:
             roles["default"] = CLIRoleConfig(prompt_path=default_role_prompt)
         elif roles["default"].prompt_path is None and default_role_prompt:
