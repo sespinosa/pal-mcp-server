@@ -51,6 +51,7 @@ class CLIClientConfig(BaseModel):
     timeout_seconds: PositiveInt | None = Field(default=None)
     roles: dict[str, CLIRoleConfig] = Field(default_factory=dict)
     output_to_file: OutputCaptureConfig | None = None
+    runner: str | None = None
 
     @field_validator("additional_args", mode="before")
     @classmethod
