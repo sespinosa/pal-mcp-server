@@ -208,6 +208,7 @@ PAL activates any provider that has credentials in your `.env`. See `.env.exampl
 
 **Collaboration & Planning** *(Enabled by default)*
 - **[`clink`](docs/tools/clink.md)** - Bridge requests to external AI CLIs (Gemini planner, codereviewer, etc.)
+- **[`mailbox`](docs/tools/mailbox.md)** *(disabled by default - [enable](#tool-configuration))* - Message other live agent sessions directly, with optional turn-end delivery hooks
 - **[`chat`](docs/tools/chat.md)** - Brainstorm ideas, get second opinions, validate approaches. With capable models (GPT-5.2 Pro, Gemini 3.0 Pro), generates complete code / implementation
 - **[`thinkdeep`](docs/tools/thinkdeep.md)** - Extended reasoning, edge case analysis, alternative perspectives
 - **[`planner`](docs/tools/planner.md)** - Break down complex projects into structured, actionable plans

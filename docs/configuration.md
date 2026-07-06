@@ -241,6 +241,24 @@ MAX_CONVERSATION_TURNS=20
 LOG_LEVEL=DEBUG  # Default: shows detailed operational messages
 ```
 
+**Inter-Agent Mailbox (mailbox tool):**
+
+These are read from the process environment rather than `.env`, because they must reach
+clink-spawned CLIs and their lifecycle hooks. See [Mailbox Tool](tools/mailbox.md).
+
+```env
+# This session's mailbox address (unset = 'parent'); typically injected per CLI
+# client via the "env" block in conf/cli_clients
+PAL_AGENT_ID=claude-worker
+
+# Spool directory for message files (default: ~/.pal/mailbox)
+PAL_MAILBOX_DIR=~/.pal/mailbox
+
+# Claude Code settings file targeted by the mailbox 'setup' action
+# (default: CLAUDE_CONFIG_DIR or ~/.claude, plus settings.json)
+PAL_CLAUDE_SETTINGS_PATH=~/.claude/settings.json
+```
+
 ## Configuration Examples
 
 ### Development Setup

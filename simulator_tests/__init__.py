@@ -21,6 +21,7 @@ from .test_debug_certain_confidence import DebugCertainConfidenceTest
 from .test_debug_validation import DebugValidationTest
 from .test_line_number_validation import LineNumberValidationTest
 from .test_logs_validation import LogsValidationTest
+from .test_mailbox_validation import MailboxValidationTest
 from .test_model_thinking_config import TestModelThinkingConfig
 from .test_o3_model_selection import O3ModelSelectionTest
 from .test_o3_pro_expensive import O3ProExpensiveTest
@@ -53,6 +54,7 @@ TEST_REGISTRY = {
     "cross_tool_comprehensive": CrossToolComprehensiveTest,
     "line_number_validation": LineNumberValidationTest,
     "logs_validation": LogsValidationTest,
+    "mailbox_validation": MailboxValidationTest,
     # "redis_validation": RedisValidationTest,  # Removed - no longer needed for standalone server
     "model_thinking_config": TestModelThinkingConfig,
     "o3_model_selection": O3ModelSelectionTest,

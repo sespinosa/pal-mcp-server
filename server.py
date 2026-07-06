@@ -58,6 +58,7 @@ from tools import (  # noqa: E402
     DocgenTool,
     ListModelsTool,
     LookupTool,
+    MailboxTool,
     PlannerTool,
     PrecommitTool,
     RefactorTool,
@@ -261,6 +262,7 @@ def filter_disabled_tools(all_tools: dict[str, Any]) -> dict[str, Any]:
 TOOLS = {
     "chat": ChatTool(),  # Interactive development chat and brainstorming
     "clink": CLinkTool(),  # Bridge requests to configured AI CLIs
+    "mailbox": MailboxTool(),  # Peer-to-peer messaging between agent sessions
     "thinkdeep": ThinkDeepTool(),  # Step-by-step deep thinking workflow with expert analysis
     "planner": PlannerTool(),  # Interactive sequential planner using workflow architecture
     "consensus": ConsensusTool(),  # Step-by-step consensus workflow with multi-model analysis
@@ -291,6 +293,11 @@ PROMPT_TEMPLATES = {
         "name": "clink",
         "description": "Forward a request to a configured AI CLI (e.g., Gemini)",
         "template": "Use clink with cli_name=<cli> to run this prompt",
+    },
+    "mailbox": {
+        "name": "mailbox",
+        "description": "Message another running agent session",
+        "template": "Use mailbox to send <message> to <agent id>",
     },
     "thinkdeep": {
         "name": "thinkdeeper",
@@ -373,6 +380,29 @@ PROMPT_TEMPLATES = {
         "template": "Show PAL MCP Server version",
     },
 }
+
+# Coordination guidance injected into the MCP handshake when the mailbox tool is
+# enabled, so orchestrating models design parallel clink work around messaging.
+MAILBOX_INSTRUCTIONS = """When you spawn workers via clink, you are their orchestrator. Design parallel work around clear ownership boundaries (each worker owns distinct files or scope) and coordinate through the `mailbox` tool.
+
+Use the mailbox when ANY apply:
+- You may need to redirect or update a running worker (send to the id clink reported at spawn)
+- One worker's discovery affects another (interface change, blocker, shared-file conflict)
+- You expect messages addressed to you (check after workers return, or at natural pauses)
+
+Do NOT use it when:
+- No other agent session exists
+- The information is a final result a clink return value already carries
+- It is a routine progress update nobody will act on
+
+Conventions: each spawn gets a unique agent id (`mailbox_agent_id` in the clink response); `list` shows the live workers in your stack; when spawning workers that must coordinate, tell each one in its task prompt which sibling ids matter and what to message them about."""
+
+
+def augment_instructions_for_mailbox(instructions: str, tools: dict) -> str:
+    """Append mailbox coordination guidance when the mailbox tool is enabled."""
+    if "mailbox" not in tools:
+        return instructions
+    return f"{instructions}\n\n{MAILBOX_INSTRUCTIONS}"
 
 
 def configure_providers():
@@ -1494,6 +1524,7 @@ async def main():
             "When the user names a specific model (e.g. 'use chat with gpt5'), send that exact model in the tool call. "
             f"When no model is mentioned, default to '{DEFAULT_MODEL}'."
         )
+    handshake_instructions = augment_instructions_for_mailbox(handshake_instructions, TOOLS)
 
     # Run the server using stdio transport (standard input/output)
     # This allows the server to be launched by MCP clients as a subprocess
