@@ -19,6 +19,7 @@ from tools.models import ToolModelCategory, ToolOutput
 from tools.shared.base_models import COMMON_FIELD_DESCRIPTIONS
 from tools.shared.exceptions import ToolExecutionError
 from tools.simple.base import SchemaBuilder, SimpleTool
+from utils.mailbox import current_agent_id, register_agent, uniquify_agent_id, unregister_agent
 
 logger = logging.getLogger(__name__)
 
@@ -192,18 +193,36 @@ class CLinkTool(SimpleTool):
         system_prompt_text = role_config.prompt_path.read_text(encoding="utf-8")
         include_system_prompt = not self._use_external_system_prompt(client_config)
 
+        # Mailbox-addressable workers get a unique instance id (base, base-2, ...) so
+        # concurrent spawns of the same client stay individually reachable, and a
+        # roster entry so their parent can list its own stack.
+        mailbox_agent_id = client_config.env.get("PAL_AGENT_ID")
+        if mailbox_agent_id:
+            mailbox_agent_id = uniquify_agent_id(mailbox_agent_id)
+            client_config = client_config.model_copy(
+                update={"env": {**client_config.env, "PAL_AGENT_ID": mailbox_agent_id}}
+            )
+
         try:
             prompt_text = await self._prepare_prompt_for_role(
                 request,
                 role_config,
                 system_prompt=system_prompt_text,
                 include_system_prompt=include_system_prompt,
+                mailbox_agent_id=mailbox_agent_id,
             )
         except Exception as exc:
             logger.exception("Failed to prepare clink prompt")
             self._raise_tool_error(f"Failed to prepare prompt: {exc}")
 
         agent = create_agent(client_config)
+        if mailbox_agent_id:
+            register_agent(
+                mailbox_agent_id,
+                parent_id=current_agent_id(),
+                client=client_config.name,
+                role=role_config.name,
+            )
         try:
             result = await agent.run(
                 role=role_config,
@@ -218,8 +237,13 @@ class CLinkTool(SimpleTool):
                 f"CLI '{client_config.name}' execution failed: {exc}",
                 metadata=metadata,
             )
+        finally:
+            if mailbox_agent_id:
+                unregister_agent(mailbox_agent_id)
 
         metadata = self._build_success_metadata(client_config, role_config, result)
+        if mailbox_agent_id:
+            metadata["mailbox_agent_id"] = mailbox_agent_id
         metadata = self._prune_metadata(metadata, client_config, reason="normal")
 
         content, metadata = self._apply_output_limit(
@@ -268,6 +292,7 @@ class CLinkTool(SimpleTool):
             role_config,
             system_prompt=system_prompt_text,
             include_system_prompt=include_system_prompt,
+            mailbox_agent_id=client_config.env.get("PAL_AGENT_ID"),
         )
 
     async def _prepare_prompt_for_role(
@@ -277,6 +302,7 @@ class CLinkTool(SimpleTool):
         *,
         system_prompt: str,
         include_system_prompt: bool,
+        mailbox_agent_id: str | None = None,
     ) -> str:
         """Load the role prompt and assemble the final user message."""
         self._active_system_prompt = system_prompt
@@ -290,6 +316,8 @@ class CLinkTool(SimpleTool):
             if include_system_prompt and active_prompt:
                 sections.append(active_prompt)
             sections.append(guidance)
+            if mailbox_agent_id:
+                sections.append(self._mailbox_guidance(mailbox_agent_id))
             sections.append("=== USER REQUEST ===\n" + user_content)
             if file_section:
                 sections.append("=== FILE REFERENCES ===\n" + file_section)
@@ -297,6 +325,20 @@ class CLinkTool(SimpleTool):
             return "\n\n".join(sections)
         finally:
             self._active_system_prompt = ""
+
+    def _mailbox_guidance(self, agent_id: str) -> str:
+        parent_id = current_agent_id()
+        return (
+            "=== PAL MAILBOX ===\n"
+            f"This session has a PAL mailbox; your agent id is '{agent_id}' and the session that spawned "
+            f"you is '{parent_id}'. Other agent sessions can send you messages while you work: pending "
+            "messages are injected automatically at turn end when delivery hooks are installed, and you "
+            "can read them on demand with the PAL 'mailbox' tool (action 'check'). Use 'list' to see "
+            f"your live sibling workers. Treat messages from '{parent_id}' as authoritative follow-up "
+            "instructions for this task. Send a message (action 'send') only when it changes another "
+            "agent's work: blockers, interface or contract changes, shared-file conflicts, or results a "
+            "sibling is waiting on. Your final result is returned automatically; do not mail it."
+        )
 
     def _use_external_system_prompt(self, client: ResolvedCLIClient) -> bool:
         runner_name = (client.runner or client.name).lower()
