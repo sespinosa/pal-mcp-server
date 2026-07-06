@@ -8,6 +8,8 @@ import shlex
 from collections.abc import Iterable
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from clink.constants import (
     CONFIG_DIR,
     DEFAULT_ROLE_PROMPT,
@@ -45,18 +47,19 @@ class ClinkRegistry:
 
     def _load(self) -> None:
         self._clients.clear()
-        for config_path in self._iter_config_files():
+        for config_path, required in self._iter_config_files():
             try:
-                data = read_json_file(str(config_path))
-            except json.JSONDecodeError as exc:
-                raise RegistryLoadError(f"Invalid JSON in {config_path}: {exc}") from exc
-
-            if not data:
-                logger.debug("Skipping empty configuration file: %s", config_path)
+                resolved = self._load_config_file(config_path)
+            except (RegistryLoadError, ValidationError) as exc:
+                if required:
+                    raise
+                # A broken user override (bad JSON, fields from a newer server version)
+                # must not take down every other client.
+                logger.warning("Skipping CLI configuration %s: %s", config_path, exc)
                 continue
 
-            config = CLIClientConfig.model_validate(data)
-            resolved = self._resolve_config(config, source_path=config_path)
+            if resolved is None:
+                continue
             key = resolved.name.lower()
             if key in self._clients:
                 logger.info("Overriding CLI configuration for '%s' from %s", resolved.name, config_path)
@@ -69,6 +72,19 @@ class ClinkRegistry:
                 "No CLI clients configured. Ensure conf/cli_clients contains at least one definition or set "
                 f"{CONFIG_ENV_VAR}."
             )
+
+    def _load_config_file(self, config_path: Path) -> ResolvedCLIClient | None:
+        try:
+            data = read_json_file(str(config_path))
+        except json.JSONDecodeError as exc:
+            raise RegistryLoadError(f"Invalid JSON in {config_path}: {exc}") from exc
+
+        if not data:
+            logger.debug("Skipping empty configuration file: %s", config_path)
+            return None
+
+        config = CLIClientConfig.model_validate(data)
+        return self._resolve_config(config, source_path=config_path)
 
     def reload(self) -> None:
         """Reload configurations from disk."""
@@ -92,24 +108,26 @@ class ClinkRegistry:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _iter_config_files(self) -> Iterable[Path]:
-        search_paths: list[Path] = []
+    def _iter_config_files(self) -> Iterable[tuple[Path, bool]]:
+        """Yield (config_path, required) pairs; only auto-discovered user overrides are optional."""
+        search_paths: list[tuple[Path, bool]] = []
 
-        # 1. Built-in configs
-        search_paths.append(CONFIG_DIR)
+        # 1. Built-in configs (errors are fatal)
+        search_paths.append((CONFIG_DIR, True))
 
-        # 2. CLI_CLIENTS_CONFIG_PATH environment override (file or directory)
+        # 2. CLI_CLIENTS_CONFIG_PATH environment override (file or directory, explicitly
+        #    requested, so errors are fatal as well)
         env_path_raw = get_env(CONFIG_ENV_VAR)
         if env_path_raw:
             env_path = Path(env_path_raw).expanduser()
-            search_paths.append(env_path)
+            search_paths.append((env_path, True))
 
-        # 3. User overrides in ~/.pal/cli_clients
-        search_paths.append(USER_CONFIG_DIR)
+        # 3. User overrides in ~/.pal/cli_clients (auto-discovered, skipped on errors)
+        search_paths.append((USER_CONFIG_DIR, False))
 
         seen: set[Path] = set()
 
-        for base in search_paths:
+        for base, required in search_paths:
             if not base:
                 continue
             if base in seen:
@@ -117,13 +135,13 @@ class ClinkRegistry:
             seen.add(base)
 
             if base.is_file() and base.suffix.lower() == ".json":
-                yield base
+                yield base, required
                 continue
 
             if base.is_dir():
                 for path in sorted(base.glob("*.json")):
                     if path.is_file():
-                        yield path
+                        yield path, required
             else:
                 logger.debug("Configuration path does not exist: %s", base)
 
@@ -132,10 +150,22 @@ class ClinkRegistry:
             raise RegistryLoadError(f"CLI configuration at {source_path} is missing a 'name' field")
 
         normalized_name = raw.name.strip()
+        runner_hint = (raw.runner or "").strip().lower() or None
+        if runner_hint and runner_hint not in INTERNAL_DEFAULTS:
+            supported = ", ".join(sorted(INTERNAL_DEFAULTS))
+            raise RegistryLoadError(
+                f"CLI '{raw.name}' declares unknown runner '{raw.runner}'. Supported runners: {supported}"
+            )
+
+        # A client named e.g. 'claude-work' with runner 'claude' inherits the built-in
+        # claude defaults (parser, internal args, prompts) under its own name.
         internal_defaults = INTERNAL_DEFAULTS.get(normalized_name.lower())
+        if internal_defaults is None and runner_hint:
+            internal_defaults = INTERNAL_DEFAULTS.get(runner_hint)
         if internal_defaults is None and raw.parser is None:
             raise RegistryLoadError(
-                f"CLI '{raw.name}' is not supported by clink. Custom CLIs must define a 'parser' in configuration."
+                f"CLI '{raw.name}' is not supported by clink. Custom CLIs must define a 'parser' "
+                "(or a 'runner' to inherit a built-in CLI's defaults) in configuration."
             )
 
         executable = self._resolve_executable(raw, internal_defaults, source_path)

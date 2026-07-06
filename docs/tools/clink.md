@@ -200,6 +200,48 @@ acknowledgement — typically containing the task id and session URL — immedia
 > and may consume paid quota. Clink never dispatches on its own — calls still go through your MCP
 > client's regular tool approval.
 
+### Named Profiles
+
+Run one CLI under several named clients by declaring `"runner"`. Each profile keeps its own env,
+args, and timeout while inheriting the built-in runner's parser, internal args, and role prompts —
+useful for separating accounts (e.g. a personal and a work Claude subscription), models, or
+permission levels:
+
+```json
+{
+  "name": "claude-work",
+  "command": "claude",
+  "runner": "claude",
+  "additional_args": ["--permission-mode", "acceptEdits", "--model", "sonnet"],
+  "env": {"CLAUDE_CONFIG_DIR": "~/.claude-work"}
+}
+```
+
+Drop this into `~/.pal/cli_clients/claude-work.json` and clink gains a `claude-work` client that
+spawns Claude Code authenticated against that config directory, while the plain `claude` client
+keeps using the default account. You only declare what differs — and each profile spends its own
+account's quota.
+
+> **CAUTION — set account variables explicitly on every profile.** Spawned CLIs inherit the PAL
+> server's environment, which in turn inherits the session that launched it. If that session
+> selects an account through an environment variable (such as `CLAUDE_CONFIG_DIR`), a profile that
+> omits the variable silently inherits it and runs — and bills — on that account instead of the
+> default one. A profile that means "the default account" must still say so:
+>
+> ```json
+> {
+>   "name": "claude",
+>   "command": "claude",
+>   "env": {"CLAUDE_CONFIG_DIR": "~/.claude"}
+> }
+> ```
+>
+> Never rely on the absence of an environment variable to select an account.
+
+Overrides in `~/.pal/cli_clients` are validated individually: a file that fails to load (for
+example one written for a newer server version) is skipped with a warning instead of disabling
+every other client.
+
 ## When to Use Clink vs Other Tools
 
 - **Use `clink`** for: Leveraging external CLI capabilities (Gemini's web search, 1M context), specialized CLI features, cross-CLI collaboration

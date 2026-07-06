@@ -107,6 +107,7 @@ class CLIClientConfig(BaseModel):
     roles: dict[str, CLIRoleConfig] = Field(default_factory=dict)
     output_to_file: OutputCaptureConfig | None = None
     parser: str | None = None
+    runner: str | None = None
     dispatch: DispatchConfig | None = None
 
     @field_validator("additional_args", mode="before")
