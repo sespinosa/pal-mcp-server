@@ -25,6 +25,7 @@ from collections.abc import Sequence
 
 from clink.models import DispatchConfig, ResolvedCLIRole
 from clink.parsers import ParserError
+from utils.progress import send_progress
 
 from .base import AgentOutput, BaseCLIAgent, CLIAgentError
 
@@ -49,12 +50,106 @@ class DispatchAgent(BaseCLIAgent):
         images: Sequence[str],
     ) -> AgentOutput:
         _ = (files, images)
-        dispatch = self.client.dispatch
-        if dispatch is None:
-            raise CLIAgentError(f"CLI '{self.client.name}' uses the dispatch runner but has no dispatch configuration")
+        dispatch = self._require_dispatch()
 
         start_time = time.monotonic()
         deadline = start_time + self.client.timeout_seconds
+
+        handle, sanitized_command, stdout, stderr = await self._dispatch(
+            role=role,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            deadline=deadline,
+        )
+
+        poll_attempts = 0
+        if dispatch.poll_args:
+            stdout, stderr, poll_attempts = await self._poll_until_done(dispatch, handle, deadline)
+            if dispatch.collect_args:
+                stdout, stderr = await self._run_phase(dispatch.collect_args, handle, deadline, phase="collect")
+
+        return self._finalize(
+            stdout=stdout,
+            stderr=stderr,
+            sanitized_command=sanitized_command,
+            duration_seconds=time.monotonic() - start_time,
+            handle=handle,
+            poll_attempts=poll_attempts,
+        )
+
+    async def dispatch_only(
+        self,
+        *,
+        role: ResolvedCLIRole,
+        prompt: str,
+        system_prompt: str | None = None,
+    ) -> tuple[str, list[str]]:
+        """Run only the dispatch phase and return ``(handle, sanitized_command)``.
+
+        Used for asynchronous (fire-then-poll-later) execution: the caller stores the
+        handle and resolves it in later requests via :meth:`check` / :meth:`collect`.
+        """
+        deadline = time.monotonic() + self.client.timeout_seconds
+        handle, sanitized_command, _, _ = await self._dispatch(
+            role=role,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            deadline=deadline,
+        )
+        return handle, sanitized_command
+
+    async def check(self, handle: str) -> tuple[str, str, str]:
+        """Run one poll cycle for ``handle``; returns ``(state, stdout, stderr)``.
+
+        State is ``running``, ``done``, or ``failed``. Unlike the blocking run loop,
+        each call gets a fresh single-phase budget.
+        """
+        dispatch = self._require_dispatch()
+        if not dispatch.poll_args:
+            raise CLIAgentError(f"CLI '{self.client.name}' has no dispatch.poll_args; its tasks cannot be polled")
+        deadline = time.monotonic() + self.client.timeout_seconds
+        return await self._poll_once(dispatch, handle, deadline)
+
+    async def collect(self, handle: str) -> AgentOutput:
+        """Fetch and parse the final result for a task already reported done."""
+        dispatch = self._require_dispatch()
+        start_time = time.monotonic()
+        deadline = start_time + self.client.timeout_seconds
+
+        # Without collect_args the poll output is the result; a done task keeps
+        # answering its poll, so re-running that phase is safe and idempotent.
+        args = dispatch.collect_args or dispatch.poll_args
+        phase = "collect" if dispatch.collect_args else "poll"
+        stdout, stderr = await self._run_phase(args, handle, deadline, phase=phase)
+
+        sanitized_command = list(self.client.executable)
+        sanitized_command.extend(arg.replace(HANDLE_PLACEHOLDER, handle) for arg in args)
+
+        return self._finalize(
+            stdout=stdout,
+            stderr=stderr,
+            sanitized_command=sanitized_command,
+            duration_seconds=time.monotonic() - start_time,
+            handle=handle,
+            poll_attempts=0,
+        )
+
+    def _require_dispatch(self) -> DispatchConfig:
+        dispatch = self.client.dispatch
+        if dispatch is None:
+            raise CLIAgentError(f"CLI '{self.client.name}' uses the dispatch runner but has no dispatch configuration")
+        return dispatch
+
+    async def _dispatch(
+        self,
+        *,
+        role: ResolvedCLIRole,
+        prompt: str,
+        system_prompt: str | None,
+        deadline: float,
+    ) -> tuple[str, list[str], str, str]:
+        """Run the dispatch phase; returns ``(handle, sanitized_command, stdout, stderr)``."""
+        dispatch = self._require_dispatch()
 
         command = self._build_command(role=role, system_prompt=system_prompt)
         command = self._resolve_executable(command)
@@ -83,21 +178,7 @@ class DispatchAgent(BaseCLIAgent):
 
         handle = self._extract_handle(dispatch, stdout, stderr)
         self._logger.info("Dispatched task via CLI '%s' (handle: %s)", self.client.name, handle)
-
-        poll_attempts = 0
-        if dispatch.poll_args:
-            stdout, stderr, poll_attempts = await self._poll_until_done(dispatch, handle, deadline)
-            if dispatch.collect_args:
-                stdout, stderr = await self._run_phase(dispatch.collect_args, handle, deadline, phase="collect")
-
-        return self._finalize(
-            stdout=stdout,
-            stderr=stderr,
-            sanitized_command=sanitized_command,
-            duration_seconds=time.monotonic() - start_time,
-            handle=handle,
-            poll_attempts=poll_attempts,
-        )
+        return handle, sanitized_command, stdout, stderr
 
     def _remaining(self, deadline: float, handle: str | None = None) -> float:
         remaining = deadline - time.monotonic()
@@ -157,6 +238,22 @@ class DispatchAgent(BaseCLIAgent):
             )
         return stdout, stderr
 
+    async def _poll_once(
+        self,
+        dispatch: DispatchConfig,
+        handle: str,
+        deadline: float,
+    ) -> tuple[str, str, str]:
+        """Run one poll cycle; returns ``(state, stdout, stderr)``."""
+        stdout, stderr = await self._run_phase(dispatch.poll_args, handle, deadline, phase="poll")
+        combined = "\n".join(part for part in (stdout, stderr) if part)
+
+        if dispatch.failed_pattern and re.search(dispatch.failed_pattern, combined):
+            return "failed", stdout, stderr
+        if re.search(dispatch.done_pattern, combined):
+            return "done", stdout, stderr
+        return "running", stdout, stderr
+
     async def _poll_until_done(
         self,
         dispatch: DispatchConfig,
@@ -166,17 +263,21 @@ class DispatchAgent(BaseCLIAgent):
         attempts = 0
         while True:
             attempts += 1
-            stdout, stderr = await self._run_phase(dispatch.poll_args, handle, deadline, phase="poll")
-            combined = "\n".join(part for part in (stdout, stderr) if part)
+            state, stdout, stderr = await self._poll_once(dispatch, handle, deadline)
 
-            if dispatch.failed_pattern and re.search(dispatch.failed_pattern, combined):
+            if state == "failed":
                 raise CLIAgentError(
                     f"CLI '{self.client.name}' reported task '{handle}' as failed",
                     stdout=stdout,
                     stderr=stderr,
                 )
-            if re.search(dispatch.done_pattern, combined):
+            if state == "done":
                 return stdout, stderr, attempts
+
+            await send_progress(
+                f"clink: task '{handle}' running on CLI '{self.client.name}' (poll #{attempts})",
+                progress=attempts,
+            )
 
             # Leave at least ~1s of budget for one final poll after sleeping.
             remaining = self._remaining(deadline, handle)

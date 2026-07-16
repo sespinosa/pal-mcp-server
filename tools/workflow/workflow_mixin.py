@@ -27,10 +27,11 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from mcp.types import TextContent
+from mcp.types import ContentBlock, TextContent
 
 from config import MCP_PROMPT_SIZE_LIMIT
 from utils.conversation_memory import add_turn, create_thread
+from utils.progress import send_progress
 
 from ..shared.base_models import ConsolidatedFindings
 from ..shared.exceptions import ToolExecutionError
@@ -597,7 +598,7 @@ class BaseWorkflowMixin(ABC):
     # Main Workflow Orchestration
     # ================================================================================
 
-    async def execute_workflow(self, arguments: dict[str, Any]) -> list[TextContent]:
+    async def execute_workflow(self, arguments: dict[str, Any]) -> list[ContentBlock]:
         """
         Main workflow orchestration following debug tool pattern.
 
@@ -611,7 +612,6 @@ class BaseWorkflowMixin(ABC):
         7. Step guidance and required actions
         8. Conversation memory integration
         """
-        from mcp.types import TextContent
 
         try:
             # Store arguments for access by helper methods
@@ -619,6 +619,12 @@ class BaseWorkflowMixin(ABC):
 
             # Validate request using tool-specific model
             request = self.get_workflow_request_model()(**arguments)
+
+            await send_progress(
+                f"{self.get_name()}: step {request.step_number}/{request.total_steps}",
+                progress=request.step_number,
+                total=request.total_steps,
+            )
 
             # Validate step field size (basic validation for workflow instructions)
             # If step is too large, user should use shorter instructions and put details in files
@@ -1279,6 +1285,8 @@ class BaseWorkflowMixin(ABC):
             # Standard expert analysis path
             response_data["status"] = "calling_expert_analysis"
 
+            await send_progress(f"{self.get_name()}: waiting on expert analysis model")
+
             # Call expert analysis
             expert_analysis = await self._call_expert_analysis(arguments, request)
             response_data["expert_analysis"] = expert_analysis
@@ -1553,7 +1561,7 @@ class BaseWorkflowMixin(ABC):
 
     # Common execute method for workflow-based tools
 
-    async def execute(self, arguments: dict[str, Any]) -> list[TextContent]:
+    async def execute(self, arguments: dict[str, Any]) -> list[ContentBlock]:
         """
         Common execute logic for workflow-based tools.
 

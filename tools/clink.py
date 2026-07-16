@@ -3,28 +3,170 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mcp.types import TextContent
+from mcp.types import ContentBlock, TextContent
 from pydantic import BaseModel, Field
 
 from clink import get_registry
 from clink.agents import AgentOutput, CLIAgentError, create_agent
+from clink.agents.dispatch import DispatchAgent
 from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from config import TEMPERATURE_BALANCED
 from tools.models import ToolModelCategory, ToolOutput
 from tools.shared.base_models import COMMON_FIELD_DESCRIPTIONS
+from tools.shared.content_blocks import file_block
 from tools.shared.exceptions import ToolExecutionError
 from tools.simple.base import SchemaBuilder, SimpleTool
+from utils import jobs
+from utils.file_utils import resolve_and_validate_path
 from utils.mailbox import current_agent_id, register_agent, uniquify_agent_id, unregister_agent
 
 logger = logging.getLogger(__name__)
 
 MAX_RESPONSE_CHARS = 20_000
 SUMMARY_PATTERN = re.compile(r"<SUMMARY>(.*?)</SUMMARY>", re.IGNORECASE | re.DOTALL)
+ARTIFACT_PATTERN = re.compile(r"<ARTIFACT>(.*?)</ARTIFACT>", re.IGNORECASE | re.DOTALL)
+MAX_ARTIFACTS = 4
+WAIT_FIELD_DESCRIPTION = (
+    "Set to false to dispatch asynchronously: the call returns a job_id immediately instead of "
+    "blocking until the task completes. Only supported for CLIs with a pollable dispatch "
+    "configuration. Poll and fetch the result with the 'jobs' tool (actions: status, collect)."
+)
+
+
+def extract_artifacts(content: str) -> tuple[str, list[ContentBlock]]:
+    """Turn ``<ARTIFACT>/abs/path</ARTIFACT>`` tags in CLI output into content blocks.
+
+    CLI output is semi-trusted: every path goes through the same security
+    validation as user-supplied file paths, and paths that fail it degrade to
+    plain text. At most MAX_ARTIFACTS files are attached.
+    """
+    blocks: list[ContentBlock] = []
+
+    def _replace(match: re.Match) -> str:
+        raw = match.group(1).strip()
+        if raw and len(blocks) < MAX_ARTIFACTS:
+            try:
+                path = resolve_and_validate_path(raw)
+                if not path.is_file():
+                    raise ValueError("not a regular file")
+                blocks.append(file_block(path))
+            except Exception as exc:
+                logger.warning("Clink ignored artifact %r: %s", raw, exc)
+        return raw
+
+    return ARTIFACT_PATTERN.sub(_replace, content), blocks
+
+
+def apply_output_limit(
+    client: ResolvedCLIClient,
+    content: str,
+    metadata: dict[str, Any],
+) -> tuple[str, dict[str, Any], list[ContentBlock]]:
+    if len(content) <= MAX_RESPONSE_CHARS:
+        return content, metadata, []
+
+    summary = _extract_summary(content)
+    if summary:
+        summary_text = summary
+        if len(summary_text) > MAX_RESPONSE_CHARS:
+            logger.debug(
+                "Clink summary from %s exceeded %d chars; truncating summary to fit.",
+                client.name,
+                MAX_RESPONSE_CHARS,
+            )
+            summary_text = summary_text[:MAX_RESPONSE_CHARS]
+        summary_metadata = _prune_metadata(metadata, client, reason="summary")
+        summary_metadata.update(
+            {
+                "output_summarized": True,
+                "output_original_length": len(content),
+                "output_summary_length": len(summary_text),
+                "output_limit": MAX_RESPONSE_CHARS,
+            }
+        )
+        logger.info(
+            "Clink compressed %s output via <SUMMARY>: original=%d chars, summary=%d chars",
+            client.name,
+            len(content),
+            len(summary_text),
+        )
+        return summary_text, summary_metadata, []
+
+    truncated_metadata = _prune_metadata(metadata, client, reason="truncated")
+    truncated_metadata.update(
+        {
+            "output_truncated": True,
+            "output_original_length": len(content),
+            "output_limit": MAX_RESPONSE_CHARS,
+        }
+    )
+
+    excerpt_limit = min(4000, MAX_RESPONSE_CHARS // 2)
+    excerpt = content[:excerpt_limit]
+    truncated_metadata["output_excerpt_length"] = len(excerpt)
+
+    logger.warning(
+        "Clink truncated %s output: original=%d chars exceeds limit=%d; excerpt_length=%d",
+        client.name,
+        len(content),
+        MAX_RESPONSE_CHARS,
+        len(excerpt),
+    )
+
+    blocks: list[ContentBlock] = []
+    full_output_note = "The full output was suppressed to stay within MCP response caps."
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix="clink-full-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        truncated_metadata["output_full_file"] = tmp_path
+        blocks.append(file_block(tmp_path))
+        full_output_note = f"The full output was saved to {tmp_path} (attached as a resource link)."
+    except OSError:
+        logger.debug("Could not persist full clink output for %s", client.name, exc_info=True)
+
+    message = (
+        f"CLI '{client.name}' produced {len(content)} characters, exceeding the configured clink limit "
+        f"({MAX_RESPONSE_CHARS} characters). {full_output_note} "
+        "Please narrow the request (review fewer files, summarize results) or run the CLI directly for the full log.\n\n"
+        f"--- Begin excerpt ({len(excerpt)} of {len(content)} chars) ---\n{excerpt}\n--- End excerpt ---"
+    )
+
+    return message, truncated_metadata, blocks
+
+
+def _extract_summary(content: str) -> str | None:
+    match = SUMMARY_PATTERN.search(content)
+    if not match:
+        return None
+    summary = match.group(1).strip()
+    return summary or None
+
+
+def _prune_metadata(
+    metadata: dict[str, Any],
+    client: ResolvedCLIClient,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    cleaned = dict(metadata)
+    events = cleaned.pop("events", None)
+    if events is not None:
+        cleaned[f"events_removed_for_{reason}"] = True
+        logger.debug(
+            "Clink dropped %s events metadata for %s response (%s)",
+            client.name,
+            reason,
+            type(events).__name__,
+        )
+    return cleaned
 
 
 class CLinkRequest(BaseModel):
@@ -50,6 +192,10 @@ class CLinkRequest(BaseModel):
     continuation_id: str | None = Field(
         default=None,
         description=COMMON_FIELD_DESCRIPTIONS["continuation_id"],
+    )
+    wait: bool = Field(
+        default=True,
+        description=WAIT_FIELD_DESCRIPTION,
     )
 
 
@@ -144,6 +290,11 @@ class CLinkTool(SimpleTool):
             "absolute_file_paths": SchemaBuilder.SIMPLE_FIELD_SCHEMAS["absolute_file_paths"],
             "images": SchemaBuilder.COMMON_FIELD_SCHEMAS["images"],
             "continuation_id": SchemaBuilder.COMMON_FIELD_SCHEMAS["continuation_id"],
+            "wait": {
+                "type": "boolean",
+                "default": True,
+                "description": WAIT_FIELD_DESCRIPTION,
+            },
         }
 
         schema = {
@@ -162,7 +313,7 @@ class CLinkTool(SimpleTool):
         """Unused by clink because we override the schema end-to-end."""
         return {}
 
-    async def execute(self, arguments: dict[str, Any]) -> list[TextContent]:
+    async def execute(self, arguments: dict[str, Any]) -> list[ContentBlock]:
         self._current_arguments = arguments
         request = self.get_request_model()(**arguments)
 
@@ -216,6 +367,19 @@ class CLinkTool(SimpleTool):
             self._raise_tool_error(f"Failed to prepare prompt: {exc}")
 
         agent = create_agent(client_config)
+
+        # Detached jobs return before any mailbox roster registration: the task runs
+        # remotely, so there is no live worker to address and no turn end to unregister.
+        if not request.wait:
+            return await self._dispatch_async(
+                agent,
+                client_config,
+                role_config,
+                prompt_text,
+                system_prompt_text,
+                continuation_id,
+            )
+
         if mailbox_agent_id:
             register_agent(
                 mailbox_agent_id,
@@ -244,11 +408,15 @@ class CLinkTool(SimpleTool):
         metadata = self._build_success_metadata(client_config, role_config, result)
         if mailbox_agent_id:
             metadata["mailbox_agent_id"] = mailbox_agent_id
-        metadata = self._prune_metadata(metadata, client_config, reason="normal")
+        metadata = _prune_metadata(metadata, client_config, reason="normal")
 
-        content, metadata = self._apply_output_limit(
+        content, artifact_blocks = extract_artifacts(result.parsed.content)
+        if artifact_blocks:
+            metadata["artifacts_attached"] = len(artifact_blocks)
+
+        content, metadata, limit_blocks = apply_output_limit(
             client_config,
-            result.parsed.content,
+            content,
             metadata,
         )
 
@@ -280,6 +448,63 @@ class CLinkTool(SimpleTool):
                 metadata=metadata,
             )
 
+        return [TextContent(type="text", text=tool_output.model_dump_json()), *artifact_blocks, *limit_blocks]
+
+    async def _dispatch_async(
+        self,
+        agent,
+        client_config: ResolvedCLIClient,
+        role_config: ResolvedCLIRole,
+        prompt_text: str,
+        system_prompt_text: str,
+        continuation_id: str | None,
+    ) -> list[ContentBlock]:
+        """Dispatch without polling and return a job record immediately (wait=false)."""
+        if not isinstance(agent, DispatchAgent) or not client_config.dispatch or not client_config.dispatch.poll_args:
+            self._raise_tool_error(
+                f"CLI '{client_config.name}' runs synchronously; wait=false requires a client with a "
+                "pollable dispatch configuration (dispatch.poll_args)."
+            )
+
+        try:
+            handle, sanitized_command = await agent.dispatch_only(
+                role=role_config,
+                prompt=prompt_text,
+                system_prompt=system_prompt_text if system_prompt_text.strip() else None,
+            )
+        except CLIAgentError as exc:
+            metadata = self._build_error_metadata(client_config, exc)
+            self._raise_tool_error(
+                f"CLI '{client_config.name}' dispatch failed: {exc}",
+                metadata=metadata,
+            )
+
+        record = jobs.create_job(
+            cli_name=client_config.name,
+            role=role_config.name,
+            handle=handle,
+            continuation_id=continuation_id,
+            sanitized_command=sanitized_command,
+        )
+
+        tool_output = ToolOutput(
+            status="success",
+            content=(
+                f"Dispatched task to CLI '{client_config.name}' (handle: {handle}). "
+                f"The task is running remotely; this session is not blocked. "
+                f"Use the 'jobs' tool with job_id '{record.job_id}' to poll (action 'status') "
+                f"and fetch the result (action 'collect')."
+            ),
+            content_type="text",
+            metadata={
+                "job_id": record.job_id,
+                "dispatch_handle": handle,
+                "cli_name": client_config.name,
+                "role": role_config.name,
+                "state": jobs.STATE_RUNNING,
+                "command": sanitized_command,
+            },
+        )
         return [TextContent(type="text", text=tool_output.model_dump_json())]
 
     async def prepare_prompt(self, request) -> str:
@@ -371,98 +596,6 @@ class CLinkTool(SimpleTool):
         merged = dict(base or {})
         merged.update(extra)
         return merged
-
-    def _apply_output_limit(
-        self,
-        client: ResolvedCLIClient,
-        content: str,
-        metadata: dict[str, Any],
-    ) -> tuple[str, dict[str, Any]]:
-        if len(content) <= MAX_RESPONSE_CHARS:
-            return content, metadata
-
-        summary = self._extract_summary(content)
-        if summary:
-            summary_text = summary
-            if len(summary_text) > MAX_RESPONSE_CHARS:
-                logger.debug(
-                    "Clink summary from %s exceeded %d chars; truncating summary to fit.",
-                    client.name,
-                    MAX_RESPONSE_CHARS,
-                )
-                summary_text = summary_text[:MAX_RESPONSE_CHARS]
-            summary_metadata = self._prune_metadata(metadata, client, reason="summary")
-            summary_metadata.update(
-                {
-                    "output_summarized": True,
-                    "output_original_length": len(content),
-                    "output_summary_length": len(summary_text),
-                    "output_limit": MAX_RESPONSE_CHARS,
-                }
-            )
-            logger.info(
-                "Clink compressed %s output via <SUMMARY>: original=%d chars, summary=%d chars",
-                client.name,
-                len(content),
-                len(summary_text),
-            )
-            return summary_text, summary_metadata
-
-        truncated_metadata = self._prune_metadata(metadata, client, reason="truncated")
-        truncated_metadata.update(
-            {
-                "output_truncated": True,
-                "output_original_length": len(content),
-                "output_limit": MAX_RESPONSE_CHARS,
-            }
-        )
-
-        excerpt_limit = min(4000, MAX_RESPONSE_CHARS // 2)
-        excerpt = content[:excerpt_limit]
-        truncated_metadata["output_excerpt_length"] = len(excerpt)
-
-        logger.warning(
-            "Clink truncated %s output: original=%d chars exceeds limit=%d; excerpt_length=%d",
-            client.name,
-            len(content),
-            MAX_RESPONSE_CHARS,
-            len(excerpt),
-        )
-
-        message = (
-            f"CLI '{client.name}' produced {len(content)} characters, exceeding the configured clink limit "
-            f"({MAX_RESPONSE_CHARS} characters). The full output was suppressed to stay within MCP response caps. "
-            "Please narrow the request (review fewer files, summarize results) or run the CLI directly for the full log.\n\n"
-            f"--- Begin excerpt ({len(excerpt)} of {len(content)} chars) ---\n{excerpt}\n--- End excerpt ---"
-        )
-
-        return message, truncated_metadata
-
-    def _extract_summary(self, content: str) -> str | None:
-        match = SUMMARY_PATTERN.search(content)
-        if not match:
-            return None
-        summary = match.group(1).strip()
-        return summary or None
-
-    def _prune_metadata(
-        self,
-        metadata: dict[str, Any],
-        client: ResolvedCLIClient,
-        *,
-        reason: str,
-    ) -> dict[str, Any]:
-        cleaned = dict(metadata)
-        events = cleaned.pop("events", None)
-        if events is not None:
-            cleaned[f"events_removed_for_{reason}"] = True
-            logger.debug(
-                "Clink dropped %s events metadata for %s response (%s)",
-                client.name,
-                reason,
-                type(events).__name__,
-            )
-        return cleaned
 
     def _build_error_metadata(self, client: ResolvedCLIClient, exc: CLIAgentError) -> dict[str, Any]:
         """Assemble metadata for failed CLI calls."""

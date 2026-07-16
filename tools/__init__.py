@@ -11,6 +11,7 @@ from .codereview import CodeReviewTool
 from .consensus import ConsensusTool
 from .debug import DebugIssueTool
 from .docgen import DocgenTool
+from .jobs import JobsTool
 from .listmodels import ListModelsTool
 from .mailbox import MailboxTool
 from .planner import PlannerTool
@@ -31,6 +32,7 @@ __all__ = [
     "LookupTool",
     "ChatTool",
     "CLinkTool",
+    "JobsTool",
     "ConsensusTool",
     "ListModelsTool",
     "MailboxTool",

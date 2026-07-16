@@ -126,6 +126,19 @@ then codereview to verify the implementation"
 5. **Seamless return** - Results flow back into your conversation with full context preserved
 6. **Continuation support** - Future tools and models can reference Gemini's findings via [continuation support](../context-revival.md) within PAL.
 
+## Rich Results (Artifacts)
+
+Clink responses are MCP content blocks, not just text. Two mechanisms attach non-text content:
+
+- **Artifact tags**: when the spawned CLI references a file it produced as
+  `<ARTIFACT>/absolute/path</ARTIFACT>` (the default role prompt advertises this), clink validates
+  the path with the same security rules as user-supplied files and attaches it — small images and
+  audio are inlined (base64), everything else becomes a resource link the client can fetch. At most
+  4 artifacts per response.
+- **Full output on truncation**: when output exceeds the response cap and no `<SUMMARY>` is present,
+  the complete output is saved to a temp file and attached as a resource link alongside the excerpt
+  (path also in `metadata.output_full_file`), so nothing is lost.
+
 ## Best Practices
 
 - **Pre-authenticate CLIs**: Install and configure Gemini CLI first (`npm install -g @google/gemini-cli`)
@@ -237,6 +250,28 @@ How it runs:
 Omit `poll_args` entirely for **fire-and-forget** services that expose no status API and deliver
 results out of band (e.g. a cloud agent that opens a pull request): clink then returns the dispatch
 acknowledgement — typically containing the task id and session URL — immediately.
+
+### Detached mode (`wait: false`)
+
+By default clink blocks until the remote task finishes. For pollable dispatch backends you can
+instead detach: pass `wait: false` and the call returns right after the dispatch phase with a
+`job_id` (plus the raw task handle) in the metadata. The remote service keeps running on its own —
+nothing in the session is blocked, and the job record survives server restarts.
+
+Resolve the job later with the companion **`jobs` tool** (registered automatically when any
+configured client has a pollable `dispatch` block):
+
+- `jobs {action: "status", job_id}` — runs exactly **one** poll cycle and reports
+  `running` / `done` / `failed`. You own the polling cadence; no server-side loop.
+- `jobs {action: "collect", job_id}` — fetches, parses, and returns the final result (identical
+  post-processing to a blocking clink call: summary/truncation limits, artifact attachment,
+  continuation recording). Collect is idempotent — repeat calls return the stored result.
+- `jobs {action: "list"}` — all known jobs with state and age.
+
+Job records are one JSON file each under `~/.pal/jobs/` and are swept after 48 hours. They store
+only the handle and routing metadata (never client configuration or secrets); the CLI client is
+re-resolved from the registry on every poll, and jobs dispatched in one session can be collected
+from another.
 
 > **Note**: A spawned cloud task usually runs on the account the backing CLI is authenticated with
 > and may consume paid quota. Clink never dispatches on its own — calls still go through your MCP

@@ -32,6 +32,7 @@ from mcp.server import Server  # noqa: E402
 from mcp.server.models import InitializationOptions  # noqa: E402
 from mcp.server.stdio import stdio_server  # noqa: E402
 from mcp.types import (  # noqa: E402
+    ContentBlock,
     GetPromptResult,
     Prompt,
     PromptMessage,
@@ -56,6 +57,7 @@ from tools import (  # noqa: E402
     ConsensusTool,
     DebugIssueTool,
     DocgenTool,
+    JobsTool,
     ListModelsTool,
     LookupTool,
     MailboxTool,
@@ -280,6 +282,28 @@ TOOLS = {
     "listmodels": ListModelsTool(),  # List all available AI models by provider
     "version": VersionTool(),  # Display server version and system information
 }
+
+
+def _clink_supports_async_jobs() -> bool:
+    """True when any configured CLI client can dispatch pollable background tasks."""
+    try:
+        from clink import get_registry
+
+        registry = get_registry()
+        for name in registry.list_clients():
+            client = registry.get_client(name)
+            if client.dispatch is not None and client.dispatch.poll_args:
+                return True
+    except Exception:
+        logger.debug("Could not inspect clink registry for async job support", exc_info=True)
+    return False
+
+
+# The jobs tool only exists alongside clink wait=false; users without an async
+# dispatch backend never pay its schema cost.
+if _clink_supports_async_jobs():
+    TOOLS["jobs"] = JobsTool()
+
 TOOLS = filter_disabled_tools(TOOLS)
 
 # Rich prompt templates for all tools
@@ -720,7 +744,7 @@ async def handle_list_tools() -> list[Tool]:
 
 
 @server.call_tool()
-async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[ContentBlock]:
     """
     Handle incoming tool execution requests from MCP clients.
 
