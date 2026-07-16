@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -66,6 +67,7 @@ def create_job(
     continuation_id: str | None = None,
     sanitized_command: list[str] | None = None,
 ) -> JobRecord:
+    """Create, persist, and return a new running job for a dispatched task."""
     sweep_stale()
     now = time.time()
     record = JobRecord(
@@ -83,16 +85,21 @@ def create_job(
 
 
 def save_job(record: JobRecord) -> None:
+    """Atomically write a job record to disk (safe against concurrent writers)."""
     record.updated_at = time.time()
     directory = jobs_dir()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{record.job_id}.json"
-    tmp_path = path.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(asdict(record), indent=2), encoding="utf-8")
-    os.replace(tmp_path, path)
+    # A unique temp name per writer keeps two sessions saving the same job_id
+    # (e.g. concurrent `jobs status`) from racing on one temp file before rename.
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f"{record.job_id}.", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(asdict(record), handle, indent=2)
+    os.replace(tmp_name, path)
 
 
 def get_job(job_id: str) -> JobRecord | None:
+    """Return a live job by id, or None if unknown, expired (deleted), or unreadable."""
     # Job ids are generated hex; reject anything else before touching the filesystem.
     if not job_id.isalnum():
         return None
@@ -107,12 +114,14 @@ def get_job(job_id: str) -> JobRecord | None:
 
 
 def list_jobs() -> list[JobRecord]:
+    """Return all live (non-expired, readable) job records, oldest first."""
     sweep_stale()
     records = (_load(path) for path in sorted(jobs_dir().glob("*.json")))
     return sorted((r for r in records if r), key=lambda r: r.created_at)
 
 
 def sweep_stale() -> None:
+    """Delete expired or unreadable job records (and any orphaned temp files)."""
     directory = jobs_dir()
     if not directory.is_dir():
         return
@@ -120,6 +129,10 @@ def sweep_stale() -> None:
         record = _load(path)
         if record is None or _expired(record):
             path.unlink(missing_ok=True)
+    # Reap temp files orphaned by a crash between write and atomic rename.
+    for tmp in directory.glob("*.tmp"):
+        if time.time() - tmp.stat().st_mtime > JOB_TTL_SECONDS:
+            tmp.unlink(missing_ok=True)
 
 
 def _expired(record: JobRecord) -> bool:
