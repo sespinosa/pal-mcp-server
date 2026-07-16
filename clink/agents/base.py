@@ -16,6 +16,7 @@ from pathlib import Path
 from clink.constants import DEFAULT_STREAM_LIMIT
 from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from clink.parsers import BaseParser, ParsedCLIResponse, ParserError, get_parser
+from utils.progress import send_progress
 
 logger = logging.getLogger("clink.agent")
 
@@ -127,6 +128,10 @@ class BaseCLIAgent:
         command = self._resolve_executable(command)
 
         sanitized_command = list(command)
+
+        # One-shot signal before the blocking subprocess call; no incremental
+        # progress is possible while communicate() runs.
+        await send_progress(f"clink: CLI '{self.client.name}' started")
 
         output_file_content: str | None = None
         start_time = time.monotonic()

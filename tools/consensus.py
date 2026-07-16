@@ -30,6 +30,7 @@ from config import TEMPERATURE_ANALYTICAL
 from systemprompts import CONSENSUS_PROMPT
 from tools.shared.base_models import ConsolidatedFindings, WorkflowRequest
 from utils.conversation_memory import MAX_CONVERSATION_TURNS, create_thread, get_thread
+from utils.progress import send_progress
 
 from .workflow.base import WorkflowTool
 
@@ -474,7 +475,13 @@ of the evidence, even when it strongly points in one direction.""",
                 self._update_consolidated_findings(step_data)
 
                 # Consult the model for this step
-                model_response = await self._consult_model(self.models_to_consult[model_idx], request)
+                model_config = self.models_to_consult[model_idx]
+                await send_progress(
+                    f"consensus: consulting {model_config['model']} ({request.step_number}/{request.total_steps})",
+                    progress=request.step_number,
+                    total=request.total_steps,
+                )
+                model_response = await self._consult_model(model_config, request)
 
                 # Add to accumulated responses
                 self.accumulated_responses.append(model_response)

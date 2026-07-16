@@ -31,6 +31,7 @@ from mcp.types import ContentBlock, TextContent
 
 from config import MCP_PROMPT_SIZE_LIMIT
 from utils.conversation_memory import add_turn, create_thread
+from utils.progress import send_progress
 
 from ..shared.base_models import ConsolidatedFindings
 from ..shared.exceptions import ToolExecutionError
@@ -618,6 +619,12 @@ class BaseWorkflowMixin(ABC):
 
             # Validate request using tool-specific model
             request = self.get_workflow_request_model()(**arguments)
+
+            await send_progress(
+                f"{self.get_name()}: step {request.step_number}/{request.total_steps}",
+                progress=request.step_number,
+                total=request.total_steps,
+            )
 
             # Validate step field size (basic validation for workflow instructions)
             # If step is too large, user should use shorter instructions and put details in files
@@ -1277,6 +1284,8 @@ class BaseWorkflowMixin(ABC):
         elif self.requires_expert_analysis() and self.should_call_expert_analysis(self.consolidated_findings, request):
             # Standard expert analysis path
             response_data["status"] = "calling_expert_analysis"
+
+            await send_progress(f"{self.get_name()}: waiting on expert analysis model")
 
             # Call expert analysis
             expert_analysis = await self._call_expert_analysis(arguments, request)

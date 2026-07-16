@@ -25,6 +25,7 @@ from collections.abc import Sequence
 
 from clink.models import DispatchConfig, ResolvedCLIRole
 from clink.parsers import ParserError
+from utils.progress import send_progress
 
 from .base import AgentOutput, BaseCLIAgent, CLIAgentError
 
@@ -272,6 +273,11 @@ class DispatchAgent(BaseCLIAgent):
                 )
             if state == "done":
                 return stdout, stderr, attempts
+
+            await send_progress(
+                f"clink: task '{handle}' running on CLI '{self.client.name}' (poll #{attempts})",
+                progress=attempts,
+            )
 
             # Leave at least ~1s of budget for one final poll after sleeping.
             remaining = self._remaining(deadline, handle)
