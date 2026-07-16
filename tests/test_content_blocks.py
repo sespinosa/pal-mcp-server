@@ -9,7 +9,7 @@ from mcp.types import AudioContent, ImageContent, ResourceLink, TextContent
 
 from clink.agents import AgentOutput
 from clink.parsers.base import ParsedCLIResponse
-from tools.clink import MAX_ARTIFACTS, MAX_RESPONSE_CHARS, CLinkTool
+from tools.clink import MAX_ARTIFACTS, MAX_RESPONSE_CHARS, CLinkTool, extract_artifacts
 from tools.shared.content_blocks import MAX_INLINE_BYTES, file_block
 
 PNG_1PX = base64.b64decode(
@@ -60,12 +60,11 @@ class TestFileBlock:
 
 class TestExtractArtifacts:
     def test_valid_file_is_attached_and_tag_stripped(self, tmp_path):
-        tool = CLinkTool()
         path = tmp_path / "result.png"
         path.write_bytes(PNG_1PX)
         content = f"Chart written.\n<ARTIFACT>{path}</ARTIFACT>\nDone."
 
-        cleaned, blocks = tool._extract_artifacts(content)
+        cleaned, blocks = extract_artifacts(content)
 
         assert "<ARTIFACT>" not in cleaned
         assert str(path) in cleaned
@@ -73,28 +72,26 @@ class TestExtractArtifacts:
         assert isinstance(blocks[0], ImageContent)
 
     def test_invalid_paths_degrade_to_plain_text(self):
-        tool = CLinkTool()
         content = (
             "<ARTIFACT>/etc/passwd</ARTIFACT> "
             "<ARTIFACT>relative/path.png</ARTIFACT> "
             "<ARTIFACT>/tmp/definitely-missing-file-xyz.png</ARTIFACT>"
         )
 
-        cleaned, blocks = tool._extract_artifacts(content)
+        cleaned, blocks = extract_artifacts(content)
 
         assert blocks == []
         assert "<ARTIFACT>" not in cleaned
         assert "/etc/passwd" in cleaned
 
     def test_artifact_count_is_capped(self, tmp_path):
-        tool = CLinkTool()
         tags = []
         for i in range(MAX_ARTIFACTS + 2):
             path = tmp_path / f"file{i}.txt"
             path.write_text("x")
             tags.append(f"<ARTIFACT>{path}</ARTIFACT>")
 
-        _, blocks = tool._extract_artifacts(" ".join(tags))
+        _, blocks = extract_artifacts(" ".join(tags))
 
         assert len(blocks) == MAX_ARTIFACTS
 
