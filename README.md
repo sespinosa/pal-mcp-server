@@ -229,6 +229,7 @@ PAL activates any provider that has credentials in your `.env`. See `.env.exampl
 **Utilities**
 - **[`apilookup`](docs/tools/apilookup.md)** - Forces current-year API/SDK documentation lookups in a sub-process (saves tokens within the current context window), prevents outdated training data responses
 - **[`challenge`](docs/tools/challenge.md)** - Prevent "You're absolutely right!" responses with critical analysis
+- **[`jobs`](docs/tools/jobs.md)** *(auto-enabled when a CLI client supports pollable dispatch)* - Check status and collect results of detached `clink` dispatches (`wait=false`)
 - **[`tracer`](docs/tools/tracer.md)** *(disabled by default - [enable](#tool-configuration))* - Static analysis prompts for call-flow mapping
 
 <details>

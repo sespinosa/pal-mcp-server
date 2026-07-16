@@ -14,7 +14,7 @@ from mcp.types import ContentBlock, TextContent
 from pydantic import BaseModel, Field
 
 from clink import get_registry
-from clink.agents import AgentOutput, CLIAgentError, create_agent
+from clink.agents import AgentOutput, BaseCLIAgent, CLIAgentError, create_agent
 from clink.agents.dispatch import DispatchAgent
 from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from config import TEMPERATURE_BALANCED
@@ -69,6 +69,12 @@ def apply_output_limit(
     content: str,
     metadata: dict[str, Any],
 ) -> tuple[str, dict[str, Any], list[ContentBlock]]:
+    """Cap CLI output that exceeds MAX_RESPONSE_CHARS.
+
+    Prefers an embedded ``<SUMMARY>``; otherwise persists the full output to a temp
+    file and returns an excerpt. Returns ``(content, metadata, extra_blocks)`` where
+    ``extra_blocks`` carries a ResourceLink to the full output on the truncation path.
+    """
     if len(content) <= MAX_RESPONSE_CHARS:
         return content, metadata, []
 
@@ -452,7 +458,7 @@ class CLinkTool(SimpleTool):
 
     async def _dispatch_async(
         self,
-        agent,
+        agent: BaseCLIAgent,
         client_config: ResolvedCLIClient,
         role_config: ResolvedCLIRole,
         prompt_text: str,

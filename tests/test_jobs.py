@@ -1,6 +1,7 @@
 """Tests for asynchronous clink jobs: store, agent API, clink wait=false, jobs tool."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,20 @@ class TestJobStore:
         store.create_job(cli_name="cloudcli", role="default", handle="h1")
 
         assert store.get_job("../evil") is None
+
+    def test_save_uses_unique_temp_and_sweeps_orphans(self, store):
+        # Atomic save must not leave the record's final file as a temp, and stale
+        # orphaned temp files (from a crash mid-write) get reaped by the sweep.
+        record = store.create_job(cli_name="cloudcli", role="default", handle="h1")
+        assert (store.jobs_dir() / f"{record.job_id}.json").exists()
+        assert not list(store.jobs_dir().glob("*.tmp"))
+
+        orphan = store.jobs_dir() / f"{record.job_id}.orphan.tmp"
+        orphan.write_text("partial", encoding="utf-8")
+        os.utime(orphan, (0, 0))  # far in the past → older than TTL
+        store.sweep_stale()
+        assert not orphan.exists()
+        assert store.get_job(record.job_id) is not None
 
 
 class TestDispatchAgentAsyncApi:
