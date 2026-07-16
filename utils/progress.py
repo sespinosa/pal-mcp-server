@@ -27,6 +27,7 @@ async def send_progress(message: str, progress: float = 0.0, total: float | None
 
     token = ctx.meta.progressToken if ctx.meta else None
     if token is None:
+        logger.debug("No progressToken in request; skipping progress: %s", message)
         return
 
     try:
@@ -36,5 +37,6 @@ async def send_progress(message: str, progress: float = 0.0, total: float | None
             total=total,
             message=message,
         )
+        logger.debug("Sent progress notification (token=%s): %s", token, message)
     except Exception:
         logger.debug("Failed to send progress notification", exc_info=True)
