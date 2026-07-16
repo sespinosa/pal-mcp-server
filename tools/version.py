@@ -21,7 +21,7 @@ try:
 except ImportError:
     HAS_URLLIB = False
 
-from mcp.types import TextContent
+from mcp.types import ContentBlock, TextContent
 
 from config import __author__, __updated__, __version__
 from tools.models import ToolModelCategory, ToolOutput
@@ -174,7 +174,7 @@ class VersionTool(BaseTool):
         """Not used for this utility tool"""
         return response
 
-    async def execute(self, arguments: dict[str, Any]) -> list[TextContent]:
+    async def execute(self, arguments: dict[str, Any]) -> list[ContentBlock]:
         """
         Display PAL MCP Server version and system information.
 

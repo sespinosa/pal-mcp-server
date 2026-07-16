@@ -32,6 +32,7 @@ from mcp.server import Server  # noqa: E402
 from mcp.server.models import InitializationOptions  # noqa: E402
 from mcp.server.stdio import stdio_server  # noqa: E402
 from mcp.types import (  # noqa: E402
+    ContentBlock,
     GetPromptResult,
     Prompt,
     PromptMessage,
@@ -690,7 +691,7 @@ async def handle_list_tools() -> list[Tool]:
 
 
 @server.call_tool()
-async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[ContentBlock]:
     """
     Handle incoming tool execution requests from MCP clients.
 

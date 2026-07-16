@@ -9,7 +9,7 @@ It shows which providers are configured and what models can be used.
 import logging
 from typing import Any, Optional
 
-from mcp.types import TextContent
+from mcp.types import ContentBlock, TextContent
 
 from providers.registries.custom import CustomEndpointModelRegistry
 from providers.registries.openrouter import OpenRouterModelRegistry
@@ -70,7 +70,7 @@ class ListModelsTool(BaseTool):
         """Not used for this utility tool"""
         return response
 
-    async def execute(self, arguments: dict[str, Any]) -> list[TextContent]:
+    async def execute(self, arguments: dict[str, Any]) -> list[ContentBlock]:
         """
         List all available models organized by provider.
 

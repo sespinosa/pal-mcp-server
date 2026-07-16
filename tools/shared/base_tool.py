@@ -14,7 +14,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
-from mcp.types import TextContent
+from mcp.types import ContentBlock
 
 if TYPE_CHECKING:
     from providers.shared import ModelCapabilities
@@ -1274,7 +1274,7 @@ When recommending searches, be specific about what information you need and why 
     # These will be provided in a full implementation but are inherited from current base.py
     # for now to maintain compatibility.
 
-    async def execute(self, arguments: dict[str, Any]) -> list[TextContent]:
+    async def execute(self, arguments: dict[str, Any]) -> list[ContentBlock]:
         """Execute the tool - will be inherited from existing base.py for now."""
         # This will be implemented by importing from the current base.py
         # for backward compatibility during the migration

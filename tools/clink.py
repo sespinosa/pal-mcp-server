@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mcp.types import TextContent
+from mcp.types import ContentBlock, TextContent
 from pydantic import BaseModel, Field
 
 from clink import get_registry
@@ -17,13 +19,17 @@ from clink.models import ResolvedCLIClient, ResolvedCLIRole
 from config import TEMPERATURE_BALANCED
 from tools.models import ToolModelCategory, ToolOutput
 from tools.shared.base_models import COMMON_FIELD_DESCRIPTIONS
+from tools.shared.content_blocks import file_block
 from tools.shared.exceptions import ToolExecutionError
 from tools.simple.base import SchemaBuilder, SimpleTool
+from utils.file_utils import resolve_and_validate_path
 
 logger = logging.getLogger(__name__)
 
 MAX_RESPONSE_CHARS = 20_000
 SUMMARY_PATTERN = re.compile(r"<SUMMARY>(.*?)</SUMMARY>", re.IGNORECASE | re.DOTALL)
+ARTIFACT_PATTERN = re.compile(r"<ARTIFACT>(.*?)</ARTIFACT>", re.IGNORECASE | re.DOTALL)
+MAX_ARTIFACTS = 4
 
 
 class CLinkRequest(BaseModel):
@@ -161,7 +167,7 @@ class CLinkTool(SimpleTool):
         """Unused by clink because we override the schema end-to-end."""
         return {}
 
-    async def execute(self, arguments: dict[str, Any]) -> list[TextContent]:
+    async def execute(self, arguments: dict[str, Any]) -> list[ContentBlock]:
         self._current_arguments = arguments
         request = self.get_request_model()(**arguments)
 
@@ -222,9 +228,13 @@ class CLinkTool(SimpleTool):
         metadata = self._build_success_metadata(client_config, role_config, result)
         metadata = self._prune_metadata(metadata, client_config, reason="normal")
 
-        content, metadata = self._apply_output_limit(
+        content, artifact_blocks = self._extract_artifacts(result.parsed.content)
+        if artifact_blocks:
+            metadata["artifacts_attached"] = len(artifact_blocks)
+
+        content, metadata, limit_blocks = self._apply_output_limit(
             client_config,
-            result.parsed.content,
+            content,
             metadata,
         )
 
@@ -256,7 +266,7 @@ class CLinkTool(SimpleTool):
                 metadata=metadata,
             )
 
-        return [TextContent(type="text", text=tool_output.model_dump_json())]
+        return [TextContent(type="text", text=tool_output.model_dump_json()), *artifact_blocks, *limit_blocks]
 
     async def prepare_prompt(self, request) -> str:
         client_config = self._registry.get_client(request.cli_name)
@@ -330,14 +340,37 @@ class CLinkTool(SimpleTool):
         merged.update(extra)
         return merged
 
+    def _extract_artifacts(self, content: str) -> tuple[str, list[ContentBlock]]:
+        """Turn ``<ARTIFACT>/abs/path</ARTIFACT>`` tags in CLI output into content blocks.
+
+        CLI output is semi-trusted: every path goes through the same security
+        validation as user-supplied file paths, and paths that fail it degrade to
+        plain text. At most MAX_ARTIFACTS files are attached.
+        """
+        blocks: list[ContentBlock] = []
+
+        def _replace(match: re.Match) -> str:
+            raw = match.group(1).strip()
+            if raw and len(blocks) < MAX_ARTIFACTS:
+                try:
+                    path = resolve_and_validate_path(raw)
+                    if not path.is_file():
+                        raise ValueError("not a regular file")
+                    blocks.append(file_block(path))
+                except Exception as exc:
+                    logger.warning("Clink ignored artifact %r: %s", raw, exc)
+            return raw
+
+        return ARTIFACT_PATTERN.sub(_replace, content), blocks
+
     def _apply_output_limit(
         self,
         client: ResolvedCLIClient,
         content: str,
         metadata: dict[str, Any],
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> tuple[str, dict[str, Any], list[ContentBlock]]:
         if len(content) <= MAX_RESPONSE_CHARS:
-            return content, metadata
+            return content, metadata, []
 
         summary = self._extract_summary(content)
         if summary:
@@ -364,7 +397,7 @@ class CLinkTool(SimpleTool):
                 len(content),
                 len(summary_text),
             )
-            return summary_text, summary_metadata
+            return summary_text, summary_metadata, []
 
         truncated_metadata = self._prune_metadata(metadata, client, reason="truncated")
         truncated_metadata.update(
@@ -387,14 +420,26 @@ class CLinkTool(SimpleTool):
             len(excerpt),
         )
 
+        blocks: list[ContentBlock] = []
+        full_output_note = "The full output was suppressed to stay within MCP response caps."
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix="clink-full-", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            truncated_metadata["output_full_file"] = tmp_path
+            blocks.append(file_block(tmp_path))
+            full_output_note = f"The full output was saved to {tmp_path} (attached as a resource link)."
+        except OSError:
+            logger.debug("Could not persist full clink output for %s", client.name, exc_info=True)
+
         message = (
             f"CLI '{client.name}' produced {len(content)} characters, exceeding the configured clink limit "
-            f"({MAX_RESPONSE_CHARS} characters). The full output was suppressed to stay within MCP response caps. "
+            f"({MAX_RESPONSE_CHARS} characters). {full_output_note} "
             "Please narrow the request (review fewer files, summarize results) or run the CLI directly for the full log.\n\n"
             f"--- Begin excerpt ({len(excerpt)} of {len(content)} chars) ---\n{excerpt}\n--- End excerpt ---"
         )
 
-        return message, truncated_metadata
+        return message, truncated_metadata, blocks
 
     def _extract_summary(self, content: str) -> str | None:
         match = SUMMARY_PATTERN.search(content)

@@ -126,6 +126,19 @@ then codereview to verify the implementation"
 5. **Seamless return** - Results flow back into your conversation with full context preserved
 6. **Continuation support** - Future tools and models can reference Gemini's findings via [continuation support](../context-revival.md) within PAL.
 
+## Rich Results (Artifacts)
+
+Clink responses are MCP content blocks, not just text. Two mechanisms attach non-text content:
+
+- **Artifact tags**: when the spawned CLI references a file it produced as
+  `<ARTIFACT>/absolute/path</ARTIFACT>` (the default role prompt advertises this), clink validates
+  the path with the same security rules as user-supplied files and attaches it — small images and
+  audio are inlined (base64), everything else becomes a resource link the client can fetch. At most
+  4 artifacts per response.
+- **Full output on truncation**: when output exceeds the response cap and no `<SUMMARY>` is present,
+  the complete output is saved to a temp file and attached as a resource link alongside the excerpt
+  (path also in `metadata.output_full_file`), so nothing is lost.
+
 ## Best Practices
 
 - **Pre-authenticate CLIs**: Install and configure Gemini CLI first (`npm install -g @google/gemini-cli`)
